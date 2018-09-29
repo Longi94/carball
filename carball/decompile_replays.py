@@ -2,20 +2,16 @@ import json
 import os
 import subprocess
 import logging
-import sys
 import platform as pt
 
-from carball.json_parser.sanity_check.sanity_check import SanityChecker
+from .analysis.analysis_manager import AnalysisManager
+from .extras.per_goal_analysis import PerGoalAnalysis
+from .json_parser.sanity_check.sanity_check import SanityChecker
+from .json_parser.game import Game
+from .controls.controls import ControlsCreator
 
-
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
-from carball.analysis.analysis_manager import AnalysisManager
 
 logger = logging.getLogger(__name__)
-
-from carball.json_parser.game import Game
-from carball.controls.controls import ControlsCreator
-
 BASE_DIR = os.path.dirname(__file__)
 
 
@@ -53,7 +49,7 @@ def decompile_replay(replay_path, output_path, overwrite=True):
 
 
 def analyze_replay_file(replay_path: str, output_path: str, overwrite=True, controls: ControlsCreator=None,
-                        sanity_check: SanityChecker=None):
+                        sanity_check: SanityChecker=None, analysis_per_goal=False):
     """
     Decompile and analyze a replay file.
 
@@ -62,14 +58,19 @@ def analyze_replay_file(replay_path: str, output_path: str, overwrite=True, cont
     :param overwrite: If to overwrite JSON (suggest True if speed is not an issue)
     :param controls: Generate controls from the replay using our best guesses (ALPHA)
     :param sanity_check: Run sanity check to make sure we analyzed correctly (BETA)
+    :param analysis_per_goal: Runs the analysis per a goal instead of the replay as a whole
     :return: AnalysisManager of game with analysis.
     """
     _json = decompile_replay(replay_path, output_path, overwrite=overwrite)
-    game = Game(loaded_json=_json)
+    game = Game()
+    game.initialize(loaded_json=_json)
     # get_controls(game)  # TODO: enable and optimise.
     if sanity_check is not None:
         sanity_check.check_game(game)
-    analysis = AnalysisManager(game)
+    if analysis_per_goal:
+        analysis = PerGoalAnalysis(game)
+    else:
+        analysis = AnalysisManager(game)
     analysis.create_analysis()
 
     if controls is not None:

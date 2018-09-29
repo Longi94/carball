@@ -6,9 +6,11 @@ from typing import List
 import pandas as pd
 
 from .actor_parsing import BallActor, CarActor
+from carball.generated.api.game_pb2 import mutators_pb2 as mutators
 from .goal import Goal
 from .player import Player
 from .team import Team
+from .game_info import GameInfo
 
 logger = logging.getLogger(__name__)
 
@@ -21,7 +23,33 @@ DATETIME_FORMATS = [
 
 class Game:
 
-    def __init__(self, file_path='', loaded_json=None):
+    def __init__(self):
+        self.file_path = None
+        self.replay = None
+        self.properties = None
+        self.replay_id = None
+        self.map = None
+        self.name = None
+        self.id = None
+        self.datetime = None
+        self.replay_version = None
+
+        self.replay_data = None
+
+        self.teams: List[Team] = None  # Added in parse_all_data
+        self.players: List[Player] = None
+        self.goals: List[Goal] = None
+        self.primary_player: dict = None
+        self.all_data = None
+
+        self.frames = None
+        self.kickoff_frames = None
+        self.ball = None
+        self.ball_type = None
+        self.demos = None
+        self.parties = None
+
+    def initialize(self, file_path='', loaded_json=None):
         self.file_path = file_path
         if loaded_json is None:
             with open(file_path, 'r') as f:
@@ -37,6 +65,8 @@ class Game:
         self.replay_id = self.find_actual_value(self.properties['Id']['value'])
         self.map = self.find_actual_value(self.properties['MapName']['value'])
         self.name = self.find_actual_value(self.properties.get('ReplayName', None))
+        self.match_type = self.find_actual_value(self.properties['MatchType']['value'])
+        self.team_size = self.find_actual_value(self.properties['TeamSize']['value'])
 
         if self.name is None:
             logger.warning('Replay name not found')
@@ -57,20 +87,12 @@ class Game:
         if self.replay_version is None:
             logger.warning('Replay version not found')
 
-        self.teams: List[Team] = []  # Added in parse_all_data
         self.players: List[Player] = self.create_players()
         self.goals: List[Goal] = self.get_goals()
         self.primary_player: dict = self.get_primary_player()
         self.all_data = self.parse_replay()
 
-        self.frames = None
-        self.kickoff_frames = None
-        self.ball = None
-        self.ball_type = None
-        self.demos = None
-        self.parties = None
         self.parse_all_data(self.all_data)
-
         logger.info("Finished parsing %s" % self)
 
     def __repr__(self):
@@ -188,7 +210,7 @@ class Game:
         cameras_data = {}  # player_actor_id: actor_data
         demos_data = []  # frame_number: demolish_data
 
-        latest_game_actor_data = None
+        game_info_actor = None
         parties = {}
         # loop through frames
         for i, frame in enumerate(frames):
@@ -247,20 +269,28 @@ class Game:
                     for _k, _v in actual_update.items():
                         current_actors[actor_id][_k] = _v
 
+            # server metadata
+            if game_info_actor is None:
+                for actor_id, actor_data in current_actors.items():
+                    if actor_data['TypeName'].endswith(':GameReplicationInfoArchetype'):
+                        game_info_actor = actor_data
+                        break
+
             # find players and ball
             for actor_id, actor_data in current_actors.items():
                 if actor_data["TypeName"] == "TAGame.Default__PRI_TA" \
-                        and "Engine.PlayerReplicationInfo:Team" in actor_data:
+                        and "Engine.PlayerReplicationInfo:PlayerName" in actor_data:
+
                     player_dict = {
                         'name': actor_data["Engine.PlayerReplicationInfo:PlayerName"],
-                        'team': actor_data["Engine.PlayerReplicationInfo:Team"],
-
-                        # 'steam_id': actor_data["Engine.PlayerReplicationInfo:UniqueId"]["SteamID64"],
-                        # 'player_id': actor_data["Engine.PlayerReplicationInfo:PlayerID"]
                     }
+                    # Conditionally add ['team'] key to player_dict
+                    player_team = actor_data.get("Engine.PlayerReplicationInfo:Team", None)
+                    if player_team is not None and player_team != -1:
+                        player_dict['team'] = player_team
+
                     if "TAGame.PRI_TA:PartyLeader" in actor_data:
                         try:
-
                             actor_type = \
                                 list(actor_data["Engine.PlayerReplicationInfo:UniqueId"]['unique_id'][
                                          'remote_id'].keys())[
@@ -285,7 +315,7 @@ class Game:
                         player_ball_data[actor_id] = {}
                     else:
                         # update player_dicts
-                        for _k, _v in actor_data.items():
+                        for _k, _v in {**actor_data, **player_dict}.items():
                             player_dicts[actor_id][_k] = _v
                 elif actor_data["ClassName"] == "TAGame.Team_Soccar_TA":
                     team_dicts[actor_id] = actor_data
@@ -319,8 +349,8 @@ class Game:
                                 or "TAGame.GameEvent_Soccar_TA:SecondsRemaining" in actor_data:
                             # TODO: Investigate if there's a less hacky way to detect GameActors with not TypeName
                             soccar_game_event_actor_id = actor_id
-                            latest_game_actor_data = actor_data
                             break
+
                 frame_data['seconds_remaining'] = current_actors[soccar_game_event_actor_id].get(
                     "TAGame.GameEvent_Soccar_TA:SecondsRemaining", None)
                 frame_data['is_overtime'] = current_actors[soccar_game_event_actor_id].get(
@@ -380,15 +410,34 @@ class Game:
                     elif actor_data["TypeName"] == "Archetypes.Ball.Ball_Default":
                         if actor_data.get('TAGame.RBActor_TA:bIgnoreSyncing', False):
                             continue
-                        self.ball_type = 'Default'
+                        self.ball_type = mutators.DEFAULT
                         # RBState = actor_data.get(REPLICATED_RB_STATE_KEY, {})
                         # ball_is_sleeping = RBState.get('Sleeping', True)
                         data_dict = BallActor.get_data_dict(actor_data, version=self.replay_version)
                         player_ball_data['ball'][frame_number] = data_dict
-                    elif actor_data["TypeName"] == "Archetypes.Ball.Ball_Basketball":
+                    elif actor_data["TypeName"] == "Archetypes.Ball.Ball_Basketball" or \
+                        actor_data["TypeName"] == "Archetypes.Ball.Ball_BasketBall":
                         if actor_data.get('TAGame.RBActor_TA:bIgnoreSyncing', False):
                             continue
-                        self.ball_type = 'Basketball'
+                        self.ball_type = mutators.BASKETBALL
+                        data_dict = BallActor.get_data_dict(actor_data, version=self.replay_version)
+                        player_ball_data['ball'][frame_number] = data_dict
+                    elif actor_data["TypeName"] == "Archetypes.Ball.Ball_Puck":
+                        if actor_data.get('TAGame.RBActor_TA:bIgnoreSyncing', False):
+                            continue
+                        self.ball_type = mutators.PUCK
+                        data_dict = BallActor.get_data_dict(actor_data, version=self.replay_version)
+                        player_ball_data['ball'][frame_number] = data_dict
+                    elif actor_data["TypeName"] == "Archetypes.Ball.CubeBall":
+                        if actor_data.get('TAGame.RBActor_TA:bIgnoreSyncing', False):
+                            continue
+                        self.ball_type = mutators.CUBEBALL
+                        data_dict = BallActor.get_data_dict(actor_data, version=self.replay_version)
+                        player_ball_data['ball'][frame_number] = data_dict
+                    elif actor_data["TypeName"] == "Archetypes.Ball.Ball_Breakout":
+                        if actor_data.get('TAGame.RBActor_TA:bIgnoreSyncing', False):
+                            continue
+                        self.ball_type = mutators.BREAKOUT
                         data_dict = BallActor.get_data_dict(actor_data, version=self.replay_version)
                         player_ball_data['ball'][frame_number] = data_dict
 
@@ -514,7 +563,7 @@ class Game:
             'frames_data': frames_data,
             'cameras_data': cameras_data,
             'demos_data': demos_data,
-            'latest_game_actor_data': latest_game_actor_data,
+            'game_info_actor': game_info_actor,
             'parties': parties
         }
 
@@ -527,7 +576,8 @@ class Game:
         :param all_data: Dict returned by parse_replay
         :return:
         """
-        self.game_actor_data = all_data['latest_game_actor_data']
+        # GAME INFO
+        self.game_info = GameInfo().parse_game_info_actor(all_data['game_info_actor'])
 
         # TEAMS
         self.teams = []
@@ -553,7 +603,16 @@ class Game:
                 player.parse_actor_data(_player_data)
             else:
                 # player not in endgame stats, create new player
-                player = Player().create_from_actor_data(_player_data, self.teams)
+                try:
+                    player = Player().create_from_actor_data(_player_data, self.teams)
+                except KeyError as e:
+                    # KeyError: 'Engine.PlayerReplicationInfo:Team'
+                    # in `team_actor_id = actor_data["Engine.PlayerReplicationInfo:Team"]`
+                    # Player never actually joins the game.
+                    if 'Engine.PlayerReplicationInfo:Team' not in _player_data:
+                        logger.warning(f"Ignoring player: {_player_data['name']} as player has no team.")
+                        continue
+                    raise e
                 self.players.append(player)
                 player_actor_id_player_dict[_player_actor_id] = player
 

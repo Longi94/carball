@@ -1,17 +1,19 @@
 
+import logging
 import time
 from typing import List, Dict, Callable
-import logging
 
 import numpy as np
 import pandas as pd
 
+from .hitbox.hitbox import Hitbox
 from ...generated.api import game_pb2
 from ...generated.api.stats.events_pb2 import Hit
 from ...json_parser.game import Game
-from .hitbox.hitbox import Hitbox
 
 logger = logging.getLogger(__name__)
+
+position_column_names = ['pos_x', 'pos_y', 'pos_z']
 
 
 class BaseHit:
@@ -27,7 +29,7 @@ class BaseHit:
         for team in game.teams:
             team_dict[team.is_orange] = team
 
-        hit_frame_numbers = BaseHit.get_hit_frame_numbers_by_ball_ang_vel(game)
+        hit_frame_numbers = BaseHit.get_hit_frame_numbers_by_ball_ang_vel(data_frame)
 
         hit_creation_time = time.time()
         logger.info('time to get get frame_numbers: %s', (hit_creation_time - start_time) * 1000)
@@ -66,7 +68,7 @@ class BaseHit:
         collision_distances_data_frame['closest_player', 'distance'] = None
         for hit_team_no in [0, 1]:
             collision_distances_for_team = collision_distances_data_frame[
-                hit_team_no].loc[game.ball['hit_team_no'] == hit_team_no]
+                hit_team_no].loc[data_frame.ball['hit_team_no'] == hit_team_no]
 
             close_collision_distances_for_team = collision_distances_for_team[
                 (collision_distances_for_team < 300).any(axis=1)
@@ -83,6 +85,29 @@ class BaseHit:
 
         all_hits = {}
         hits_data = collision_distances_data_frame['closest_player'].dropna()
+
+        hit_frames_to_keep = []
+        for row in hits_data.itertuples():
+            frame_number, player_name, collision_distance = row.Index, row.name, row.distance
+            # Remove frame numbers where there is a hit in the next or previous frame by the same player
+            # and player is closer in that (next or previous) hit frame.
+            try:
+                previous_frame_hit = hits_data.loc[frame_number - 1]
+                if previous_frame_hit.loc['name'] == player_name and previous_frame_hit.distance < collision_distance:
+                    continue
+            except KeyError:
+                pass
+            try:
+                next_frame_hit = hits_data.loc[frame_number + 1]
+                if next_frame_hit.loc['name'] == player_name and next_frame_hit.distance < collision_distance:
+                    continue
+            except KeyError:
+                pass
+
+            hit_frames_to_keep.append(frame_number)
+
+        hits_data = hits_data.loc[hit_frames_to_keep]
+
         for row in hits_data.itertuples():
             frame_number, player_name, collision_distance = row.Index, row.name, row.distance
             hit = proto_game.game_stats.hits.add()
@@ -92,7 +117,7 @@ class BaseHit:
                 hit.goal_number = int(goal_number)
             id_creation(hit.player_id, player_name)
             hit.collision_distance = collision_distance
-            ball_position = game.ball.loc[frame_number, ['pos_x', 'pos_y', 'pos_z']]
+            ball_position = data_frame.ball.loc[frame_number, position_column_names]
             hit.ball_data.pos_x = float(ball_position['pos_x'])
             hit.ball_data.pos_y = float(ball_position['pos_y'])
             hit.ball_data.pos_z = float(ball_position['pos_z'])
@@ -103,27 +128,30 @@ class BaseHit:
         return all_hits
 
     @staticmethod
-    def get_hit_frame_numbers_by_ball_ang_vel(game) -> List[int]:
-        ball_ang_vels = game.ball.loc[:, ['ang_vel_x', 'ang_vel_y', 'ang_vel_z']]
+    def get_hit_frame_numbers_by_ball_ang_vel(data_frame: pd.DataFrame) -> List[int]:
+        ball_ang_vels = data_frame.ball.loc[:, ['ang_vel_x', 'ang_vel_y', 'ang_vel_z']]
         diff_series = ball_ang_vels.diff().any(axis=1)
         indices = diff_series.index[diff_series].tolist()
         return indices
 
     @staticmethod
-    def get_ball_data(game: Game, hit: Hit):
-        return game.ball.loc[hit.frame_number, :]
+    def get_ball_data(data_frame: pd.DataFrame, hit: Hit):
+        return data_frame.ball.loc[hit.frame_number, :]
 
 
 def get_player_ball_displacements(data_frame: pd.DataFrame, player_name: str) -> pd.DataFrame:
     player_df = data_frame[player_name]
     ball_df = data_frame['ball']
-    position_column_names = ['pos_x', 'pos_y', 'pos_z']
-    return player_df[position_column_names] - ball_df[position_column_names]
+
+    result = player_df[position_column_names] - ball_df[position_column_names]
+    return result
 
 
 def get_distance_from_displacements(data_frame: pd.DataFrame) -> pd.Series:
-    position_column_names = ['pos_x', 'pos_y', 'pos_z']
-    return np.sqrt((data_frame[position_column_names] ** 2).sum(axis=1))
+    positions = data_frame[position_column_names]
+
+    summed = (positions ** 2).sum(axis=1, skipna=False)
+    return np.sqrt(summed)
 
 
 def get_rotation_matrices(data_frame: pd.DataFrame, player_name: str) -> pd.Series:
@@ -156,7 +184,6 @@ def get_rotation_matrix_from_row(components: pd.Series) -> np.array:
 
 
 def get_local_displacement(displacement: pd.DataFrame, rotation_matrices: pd.Series) -> pd.DataFrame:
-    position_column_names = ['pos_x', 'pos_y', 'pos_z']
     displacement_vectors = np.expand_dims(displacement[position_column_names].values, 2)
     inverse_rotation_matrices: pd.Series = np.transpose(rotation_matrices)
     inverse_rotation_array = np.stack(inverse_rotation_matrices.values)
